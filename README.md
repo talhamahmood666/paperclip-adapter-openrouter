@@ -303,7 +303,7 @@ Go to [github.com/paperclipai/paperclip/issues/new](https://github.com/paperclip
 I've built a complete OpenRouter adapter for Paperclip that gives any agent access to 300+ AI models
 (free and paid) through a single OpenRouter API key.
 
-**Repo:** https://github.com/YOUR_USERNAME/paperclip-adapter-openrouter
+**Repo:** https://github.com/talhamahmood666/paperclip-adapter-openrouter
 
 ## Why This Matters
 
@@ -354,7 +354,7 @@ Related issues: #187 (Ollama/local LLM support), #455 (Gemini adapter)
 4. Under the **Plugins/Extensions** section, add:
 
 ```markdown
-- [paperclip-adapter-openrouter](https://github.com/YOUR_USERNAME/paperclip-adapter-openrouter) - OpenRouter adapter — access 300+ AI models (free & paid) via single API key. Dynamic model discovery, auto-routing, cost tracking, streaming, and reasoning support.
+- [paperclip-adapter-openrouter](https://github.com/talhamahmood666/paperclip-adapter-openrouter) - OpenRouter adapter — access 300+ AI models (free & paid) via single API key. Dynamic model discovery, auto-routing, cost tracking, streaming, and reasoning support.
 ```
 
 5. Commit message: `Add paperclip-adapter-openrouter`
@@ -371,7 +371,7 @@ Adds community OpenRouter adapter for Paperclip.
 - Auto-routing, fallback, streaming, reasoning, cost tracking
 - Copy-paste registry patches included
 
-Repo: https://github.com/YOUR_USERNAME/paperclip-adapter-openrouter
+Repo: https://github.com/talhamahmood666/paperclip-adapter-openrouter
 ```
 
 ---
@@ -389,7 +389,7 @@ Just shipped an OpenRouter adapter for @paperclipai 📎🔀
 
 Your Paperclip agents can now think with Llama 4, DeepSeek R1, Claude, GPT-4.1, Gemini, Qwen, Mistral — all from one adapter.
 
-Open source 🔓 github.com/YOUR_USERNAME/paperclip-adapter-openrouter
+Open source 🔓 github.com/talhamahmood666/paperclip-adapter-openrouter
 
 @daborin @OpenRouterAI #Paperclip #AI #OpenSource
 ```
