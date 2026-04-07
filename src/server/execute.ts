@@ -315,8 +315,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let totalUsage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
   let finalAssistantText = "";
   let turn = 0;
-  let stoppedReason: "completed" | "max_turns" | "error" = "completed";
+  let stoppedReason: "completed" | "max_turns" | "error" | "repeat_loop" = "completed";
   let runError: { message: string; code: string } | null = null;
+  // Repeat-call detection: if the model calls the same tool with the same args
+  // three times in a row, break the loop. Prevents 20+ retries when the model
+  // misreads an error message and keeps "fixing" it the same wrong way.
+  const recentCalls: string[] = [];
+  const REPEAT_THRESHOLD = 3;
 
   try {
     while (turn < maxTurns) {
@@ -414,7 +419,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           tool_call_id: tc.id,
           content: resultContent,
         });
+
+        // Track repeat calls
+        const callSig = `${toolName}::${JSON.stringify(args)}`;
+        recentCalls.push(callSig);
+        if (recentCalls.length > REPEAT_THRESHOLD) recentCalls.shift();
+        if (
+          recentCalls.length === REPEAT_THRESHOLD &&
+          recentCalls.every((s) => s === callSig)
+        ) {
+          await writeRawStderr(
+            onLog,
+            `[openrouter] Tool "${toolName}" called ${REPEAT_THRESHOLD}x with identical args — breaking loop.`,
+          );
+          runError = {
+            message: `Tool "${toolName}" was called ${REPEAT_THRESHOLD} times in a row with identical arguments. The model is stuck in a retry loop.`,
+            code: "tool_repeat_loop",
+          };
+          stoppedReason = "repeat_loop";
+          break;
+        }
       }
+      if (stoppedReason === "repeat_loop") break;
     }
 
     if (turn >= maxTurns && stoppedReason !== "error") {
@@ -458,6 +484,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     } else if (stoppedReason === "max_turns") {
       nextStatus = "blocked";
       statusReason = `Hit max_turns (${maxTurns}) without completing`;
+    } else if (stoppedReason === "repeat_loop" && runError) {
+      nextStatus = "blocked";
+      statusReason = runError.message;
     } else if (stoppedReason === "error" && runError) {
       nextStatus = "blocked";
       statusReason = runError.message;

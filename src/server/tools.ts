@@ -302,10 +302,9 @@ function hireAgentTool(ctx: BuildToolsContext): Tool {
       // Default path: route through approvals so a human signs off.
       return safeCall("hire_agent (approval)", () =>
         ctx.api.createApproval(ctx.companyId, {
-          kind: "hire_agent",
+          type: "hire_agent",
           requestedByAgentId: ctx.agentId,
-          payload,
-          summary: `Hire ${args.name} as ${args.role}`,
+          payload: { ...payload, summary: `Hire ${args.name} as ${args.role}` },
         }),
       );
     },
@@ -319,26 +318,36 @@ function requestApprovalTool(ctx: BuildToolsContext): Tool {
       function: {
         name: "request_approval",
         description:
-          "Open an approval request for any action that requires human sign-off (budget changes, " +
-          "external API spend, sensitive data access, etc).",
+          "Open an approval request for an action that requires human sign-off. " +
+          "Only three types are currently supported by Paperclip: hire_agent, " +
+          "approve_ceo_strategy, budget_override_required. For hiring, prefer the " +
+          "dedicated hire_agent tool instead.",
         parameters: {
           type: "object",
           properties: {
-            kind: { type: "string", description: "Approval kind, e.g. 'budget_increase', 'external_spend'." },
+            type: {
+              type: "string",
+              enum: ["hire_agent", "approve_ceo_strategy", "budget_override_required"],
+              description: "Approval type — must be one of the three supported values.",
+            },
             summary: { type: "string", description: "One-line summary for the operator." },
-            details: { type: "object", description: "Structured payload describing the action." },
+            payload: { type: "object", description: "Structured payload describing the action." },
           },
-          required: ["kind", "summary"],
+          required: ["type", "summary"],
         },
       },
     },
     execute: async (args) => {
+      const type = asString(args.type);
+      const summary = asString(args.summary);
+      if (!type) return fail("type is required and must be hire_agent / approve_ceo_strategy / budget_override_required.");
+      if (!summary) return fail("summary is required.");
+      const payload = (args.payload && typeof args.payload === "object" ? args.payload : {}) as Record<string, unknown>;
       return safeCall("request_approval", () =>
         ctx.api.createApproval(ctx.companyId, {
-          kind: args.kind,
-          summary: args.summary,
-          payload: args.details ?? {},
+          type,
           requestedByAgentId: ctx.agentId,
+          payload: { ...payload, summary },
         }),
       );
     },
