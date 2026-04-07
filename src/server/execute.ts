@@ -272,9 +272,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     content: wakePrompt || JSON.stringify(context),
   });
 
+  // ----- check out issue (acquire run lock) -----
+  //
+  // Paperclip's sameRunLock check rejects any write to an issue (comments,
+  // status changes, etc.) unless the issue's checkoutRunId matches the
+  // calling run id. The CLI adapters get this for free because Paperclip's
+  // wake handler pre-checks-out the issue for them; pure-HTTP adapters
+  // don't, so we have to do it ourselves before any tool can mutate state.
+  //
+  // If checkout fails (issue locked by another live run, project paused,
+  // etc.), we log and proceed without tools — same graceful degradation
+  // we apply when authToken is missing.
+
+  let issueLocked = false;
+  if (api && currentIssueId) {
+    try {
+      await api.checkoutIssue(currentIssueId, agent.id);
+      issueLocked = true;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await writeRawStderr(
+        onLog,
+        `[openrouter] could not check out issue ${currentIssueId}: ${reason}. Tool writes will fail; proceeding read-only.`,
+      );
+    }
+  }
+
   // ----- mark issue in_progress -----
 
-  if (api && currentIssueId) {
+  if (api && currentIssueId && issueLocked) {
     try {
       await api.updateIssue(currentIssueId, { status: "in_progress" });
     } catch (err) {

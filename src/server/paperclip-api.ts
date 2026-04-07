@@ -126,6 +126,29 @@ export class PaperclipApi {
     return this.request("GET", `/api/issues/${encodeURIComponent(issueId)}/heartbeat-context`);
   }
 
+  /**
+   * Acquire the issue lock for the current run. Required before any
+   * write operation (add_comment, update status) on an issue, otherwise
+   * Paperclip's sameRunLock check rejects with 409 "Issue run ownership
+   * conflict". The run id is read by Paperclip from the JWT claims, so
+   * we only need to send agentId + expectedStatuses in the body.
+   *
+   * expectedStatuses is the set of statuses the issue is allowed to be
+   * in for the checkout to succeed. We default to the broad set so a
+   * brand-new run can adopt an issue regardless of which lifecycle
+   * stage it's currently in.
+   */
+  checkoutIssue(
+    issueId: string,
+    agentId: string,
+    expectedStatuses: string[] = ["open", "in_progress", "blocked"],
+  ): Promise<Record<string, unknown>> {
+    return this.request("POST", `/api/issues/${encodeURIComponent(issueId)}/checkout`, {
+      agentId,
+      expectedStatuses,
+    });
+  }
+
   // ----- Comments -----
 
   listIssueComments(issueId: string): Promise<Record<string, unknown>> {
