@@ -113,4 +113,8 @@ export interface OpenRouterConfig {
   autoApprove?: boolean;
   /** Override path to skills directory. Defaults to ~/.openrouter-adapter/skills. */
   skillsDir?: string;
+  /** Absolute path to a markdown file that will be read at runtime and
+   * prepended to the system prompt. Takes precedence over systemPrompt
+   * if both are set. */
+  instructionsFilePath?: string;
 }

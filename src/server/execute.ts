@@ -23,6 +23,7 @@ import type {
   AdapterExecutionResult,
   UsageSummary,
 } from "@paperclipai/adapter-utils";
+import fs from "node:fs/promises";
 import {
   renderPaperclipWakePrompt,
 } from "@paperclipai/adapter-utils/server-utils";
@@ -245,8 +246,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const messages: ChatMessage[] = [];
 
-  // System prompt = base + skills
+  // System prompt = base + skills + optional instructions file
   let systemContent = config.systemPrompt || DEFAULT_SYSTEM_PROMPT;
+
+  // If instructionsFilePath is set, read the file and use it as the base.
+  // This mirrors the behavior of claude-local / codex-local / etc., letting
+  // operators version-control long agent instructions in a markdown file
+  // instead of pasting them into the inline systemPrompt field.
+  const instructionsFilePath = (config as Record<string, unknown>).instructionsFilePath;
+  if (typeof instructionsFilePath === "string" && instructionsFilePath.trim().length > 0) {
+    try {
+      const fileContent = await fs.readFile(instructionsFilePath.trim(), "utf8");
+      if (fileContent.trim().length > 0) {
+        systemContent = fileContent.trim();
+      }
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await writeRawStderr(
+        onLog,
+        `[openrouter] could not read instructionsFilePath ${instructionsFilePath}: ${reason}. Falling back to systemPrompt.`,
+      );
+    }
+  }
   try {
     const skills = await loadSkills({ agentConfig: config as unknown as Record<string, unknown>, onLog });
     if (skills.length > 0) {
