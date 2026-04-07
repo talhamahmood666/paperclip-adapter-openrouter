@@ -107,4 +107,10 @@ export interface OpenRouterConfig {
   route?: "fallback" | "no-fallback";
   httpReferer?: string;
   xTitle?: string;
+  /** Max tool-loop turns per run. Default 25. */
+  maxTurns?: number;
+  /** Skip approval gates for hire_agent and similar mutating tools. Default false. */
+  autoApprove?: boolean;
+  /** Override path to skills directory. Defaults to ~/.openrouter-adapter/skills. */
+  skillsDir?: string;
 }
