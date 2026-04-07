@@ -253,7 +253,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // This mirrors the behavior of claude-local / codex-local / etc., letting
   // operators version-control long agent instructions in a markdown file
   // instead of pasting them into the inline systemPrompt field.
-  const instructionsFilePath = (config as Record<string, unknown>).instructionsFilePath;
+  const instructionsFilePath = (config as unknown as Record<string, unknown>).instructionsFilePath;
   if (typeof instructionsFilePath === "string" && instructionsFilePath.trim().length > 0) {
     try {
       const fileContent = await fs.readFile(instructionsFilePath.trim(), "utf8");
