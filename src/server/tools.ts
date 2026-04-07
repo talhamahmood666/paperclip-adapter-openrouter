@@ -311,6 +311,42 @@ function hireAgentTool(ctx: BuildToolsContext): Tool {
   };
 }
 
+function listAgentsTool(ctx: BuildToolsContext): Tool {
+  return {
+    schema: {
+      type: "function",
+      function: {
+        name: "list_agents",
+        description:
+          "List all agents (teammates) in the current company. Returns each agent's id, name, " +
+          "role, title, adapter type, model, and status. Use this BEFORE delegating work with " +
+          "create_sub_issue or hire_agent so you can reference real agent ids instead of guessing.",
+        parameters: {
+          type: "object",
+          properties: {},
+        },
+      },
+    },
+    execute: async () => {
+      return safeCall("list_agents", async () => {
+        const agents = await ctx.api.listCompanyAgents(ctx.companyId);
+        // Trim to fields the model actually needs — full agent objects can be huge
+        // and waste context window on hundreds of irrelevant runtime config keys.
+        return agents.map((a) => ({
+          id: a.id,
+          name: a.name,
+          role: a.role,
+          title: a.title,
+          adapterType: a.adapterType,
+          model: (a.adapterConfig as Record<string, unknown> | undefined)?.model ?? null,
+          status: a.status,
+          reportsToAgentId: a.reportsToAgentId ?? null,
+        }));
+      });
+    },
+  };
+}
+
 function requestApprovalTool(ctx: BuildToolsContext): Tool {
   return {
     schema: {
@@ -364,6 +400,7 @@ export function buildTools(ctx: BuildToolsContext): Tool[] {
     listCommentsTool(ctx),
     createSubIssueTool(ctx),
     listIssuesTool(ctx),
+    listAgentsTool(ctx),
     hireAgentTool(ctx),
     requestApprovalTool(ctx),
   ];

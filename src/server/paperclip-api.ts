@@ -171,6 +171,15 @@ export class PaperclipApi {
 
   // ----- Agents -----
 
+  /**
+   * List all agents in a company. Returns the array directly (no envelope).
+   * Used by the list_agents tool so a CEO can discover teammate IDs before
+   * delegating work via create_sub_issue or update_issue_status.
+   */
+  listCompanyAgents(companyId: string): Promise<Record<string, unknown>[]> {
+    return this.request("GET", `/api/companies/${encodeURIComponent(companyId)}/agents`);
+  }
+
   hireAgent(companyId: string, hire: Record<string, unknown>): Promise<Record<string, unknown>> {
     return this.request("POST", `/api/companies/${encodeURIComponent(companyId)}/agent-hires`, hire);
   }
