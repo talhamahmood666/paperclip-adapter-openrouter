@@ -284,17 +284,36 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // etc.), we log and proceed without tools — same graceful degradation
   // we apply when authToken is missing.
 
-  let issueLocked = false;
-  if (api && currentIssueId) {
+  // If Paperclip's heartbeat dispatcher already stamped this run as the
+  // issue's executionRunId, the lock is effectively held by us already and
+  // an explicit checkout call would be redundant (and on some Paperclip
+  // versions, return a validation error). Detect that and skip.
+  const preLocked = (() => {
+    const wakeIssue = (context.paperclipWake as Record<string, unknown> | undefined)?.issue as
+      | Record<string, unknown>
+      | undefined;
+    const ctxIssue = (context.issue as Record<string, unknown> | undefined) ?? wakeIssue;
+    const execRunId =
+      typeof ctxIssue?.executionRunId === "string" ? ctxIssue.executionRunId : null;
+    return !!execRunId && execRunId === ctx.runId;
+  })();
+
+  let issueLocked = preLocked;
+  if (api && currentIssueId && !preLocked) {
     try {
       await api.checkoutIssue(currentIssueId, agent.id);
       issueLocked = true;
     } catch (err) {
+      // Best-effort: many runs are dispatched by the heartbeat which already
+      // holds the lock for us, so a checkout failure is not necessarily
+      // fatal. We try the writes anyway and let Paperclip enforce the real
+      // ownership check at write time.
       const reason = err instanceof Error ? err.message : String(err);
       await writeRawStderr(
         onLog,
-        `[openrouter] could not check out issue ${currentIssueId}: ${reason}. Tool writes will fail; proceeding read-only.`,
+        `[openrouter] checkout call failed for ${currentIssueId}: ${reason}. Continuing — Paperclip may still accept writes if the heartbeat pre-locked the issue.`,
       );
+      issueLocked = true;
     }
   }
 
