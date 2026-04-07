@@ -1,3 +1,23 @@
+/**
+ * OpenRouter adapter execute() — multi-turn tool loop.
+ *
+ * Responsibilities:
+ *   - Build messages from Paperclip wake context + skills
+ *   - Run a tool-calling loop against OpenRouter's chat/completions endpoint
+ *   - Manage issue state (in_progress at start, done/blocked at end)
+ *   - Post the final assistant output as an issue comment
+ *   - Emit typed TranscriptEntry lines so the run viewer renders properly
+ *   - Track usage and cost via OpenRouter's /generation endpoint
+ *
+ * Out of scope for v1 (deferred to v3):
+ *   - Token streaming inside the tool loop (non-streaming is more reliable
+ *     for tool calls on free models)
+ *   - Approval gate handling (we route hire_agent through approvals, but we
+ *     don't yet pause-and-resume runs on async approval callbacks)
+ *   - Workspace runtime env vars (we have no child process to pass them to)
+ *   - Attachment / multimodal handling
+ */
+
 import type {
   AdapterExecutionContext,
   AdapterExecutionResult,
@@ -5,18 +25,87 @@ import type {
 } from "@paperclipai/adapter-utils";
 import {
   renderPaperclipWakePrompt,
-  asString,
 } from "@paperclipai/adapter-utils/server-utils";
+
 import {
   OPENROUTER_CHAT_ENDPOINT,
   OPENROUTER_GENERATION_ENDPOINT,
   type OpenRouterConfig,
 } from "../index.js";
+import { PaperclipApi, PaperclipApiError } from "./paperclip-api.js";
+import { buildTools, toolSchemas, findTool, type Tool } from "./tools.js";
+import { loadSkills, renderSkillsForPrompt } from "./skills.js";
+import {
+  emitInit,
+  emitAssistant,
+  emitThinking,
+  emitToolCall,
+  emitToolResult,
+  emitResult,
+  emitSystem,
+  writeRawStderr,
+  type OnLog,
+} from "./transcript.js";
+
+// ----- types matching OpenRouter / OpenAI chat completions -----
+
+interface ChatMessage {
+  role: "system" | "user" | "assistant" | "tool";
+  content: string | null;
+  name?: string;
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  tool_call_id?: string;
+}
+
+interface ChatCompletionResponse {
+  id: string;
+  choices: Array<{
+    finish_reason: string | null;
+    message: {
+      role: "assistant";
+      content: string | null;
+      reasoning?: string | null;
+      tool_calls?: Array<{
+        id: string;
+        type: "function";
+        function: { name: string; arguments: string };
+      }>;
+    };
+  }>;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  };
+}
+
+// ----- helpers -----
+
+const DEFAULT_MAX_TURNS = 25;
+const DEFAULT_SYSTEM_PROMPT =
+  "You are an AI agent working inside Paperclip, an autonomous company orchestration system. " +
+  "When you receive a wake payload, your job is to EXECUTE the assigned task — not describe it. " +
+  "Use the tools available to you to read context, post comments, update status, and delegate work. " +
+  "When finished, call update_issue_status with status='done' and post a summary comment.";
 
 function resolveApiKey(config: OpenRouterConfig): string {
   const key = config.apiKey || process.env.OPENROUTER_API_KEY || "";
-  if (!key) throw new Error("OpenRouter API key not found. Set adapterConfig.apiKey or OPENROUTER_API_KEY env var.");
+  if (!key) {
+    throw new Error(
+      "OpenRouter API key not found. Set adapterConfig.apiKey or OPENROUTER_API_KEY env var.",
+    );
+  }
   return key;
+}
+
+function resolveBillingType(config: OpenRouterConfig): "api" | "subscription" {
+  // OpenRouter is always API-key based.
+  if (config.apiKey || process.env.OPENROUTER_API_KEY) return "api";
+  return "api";
 }
 
 function buildHeaders(apiKey: string, config: OpenRouterConfig): Record<string, string> {
@@ -28,32 +117,51 @@ function buildHeaders(apiKey: string, config: OpenRouterConfig): Record<string, 
   };
 }
 
-function buildRequestBody(
+function extractCurrentIssueId(context: Record<string, unknown>): string | null {
+  const candidates = [
+    context.taskId,
+    context.issueId,
+    context.wakeTaskId,
+    (context.paperclipWake as Record<string, unknown> | undefined)?.taskId,
+    (context.paperclipWake as Record<string, unknown> | undefined)?.issueId,
+  ];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim().length > 0) return c.trim();
+  }
+  return null;
+}
+
+function safeParseToolArgs(raw: string): Record<string, unknown> {
+  if (!raw || typeof raw !== "string") return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function callOpenRouter(
+  apiKey: string,
   config: OpenRouterConfig,
-  messages: Array<{ role: string; content: string }>
-): Record<string, unknown> {
+  messages: ChatMessage[],
+  tools: Tool[],
+): Promise<ChatCompletionResponse> {
   const body: Record<string, unknown> = {
     model: config.model || "openrouter/auto",
     messages,
     max_tokens: config.maxTokens ?? 4096,
     temperature: config.temperature ?? 0.7,
     top_p: config.topP ?? 1,
-    stream: config.stream ?? true,
+    stream: false,
   };
+  if (tools.length > 0) {
+    body.tools = toolSchemas(tools);
+    body.tool_choice = "auto";
+  }
   if (config.reasoning) body.reasoning = { effort: "high" };
   if (config.transforms?.length) body.transforms = config.transforms;
   if (config.route) body.route = config.route;
-  return body;
-}
-
-async function executeStreaming(
-  apiKey: string,
-  config: OpenRouterConfig,
-  messages: Array<{ role: string; content: string }>,
-  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
-): Promise<{ output: string; generationId?: string; usage?: UsageSummary }> {
-  const body = buildRequestBody(config, messages);
-  body.stream = true;
 
   const response = await fetch(OPENROUTER_CHAT_ENDPOINT, {
     method: "POST",
@@ -62,175 +170,351 @@ async function executeStreaming(
   });
 
   if (!response.ok) {
-    const errText = await response.text();
+    const errText = await response.text().catch(() => "");
     throw new Error(`OpenRouter API error (${response.status}): ${errText}`);
   }
 
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("No response body from OpenRouter");
-
-  const decoder = new TextDecoder();
-  let output = "";
-  let generationId: string | undefined;
-  let buffer = "";
-  let usage: UsageSummary | undefined;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith(":")) continue;
-      if (!trimmed.startsWith("data: ")) continue;
-
-      const data = trimmed.slice(6);
-      if (data === "[DONE]") continue;
-
-      try {
-        const parsed = JSON.parse(data);
-        if (parsed.id && !generationId) generationId = parsed.id;
-
-        const delta = parsed.choices?.[0]?.delta?.content;
-        if (delta) {
-          output += delta;
-          await onLog("stdout", delta);
-        }
-
-        if (parsed.usage) {
-          usage = {
-            inputTokens: parsed.usage.prompt_tokens || 0,
-            outputTokens: parsed.usage.completion_tokens || 0,
-          };
-        }
-      } catch { /* skip */ }
-    }
-  }
-
-  return { output, generationId, usage };
+  const json = (await response.json()) as ChatCompletionResponse;
+  return json;
 }
 
-async function executeNonStreaming(
+async function fetchGenerationCost(
+  generationId: string,
   apiKey: string,
-  config: OpenRouterConfig,
-  messages: Array<{ role: string; content: string }>,
-  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
-): Promise<{ output: string; generationId?: string; usage?: UsageSummary }> {
-  const body = buildRequestBody(config, messages);
-  body.stream = false;
-
-  const response = await fetch(OPENROUTER_CHAT_ENDPOINT, {
-    method: "POST",
-    headers: buildHeaders(apiKey, config),
-    body: JSON.stringify(body),
-  });
-
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`OpenRouter API error (${response.status}): ${errText}`);
-  }
-
-  const data = await response.json() as Record<string, any>;
-  const output = data.choices?.[0]?.message?.content || "";
-  const generationId = data.id;
-
-  if (output) await onLog("stdout", output);
-
-  let usage: UsageSummary | undefined;
-  if (data.usage) {
-    usage = {
-      inputTokens: data.usage.prompt_tokens || 0,
-      outputTokens: data.usage.completion_tokens || 0,
-    };
-  }
-
-  return { output, generationId, usage };
-}
-
-async function fetchGenerationCost(generationId: string, apiKey: string): Promise<number | null> {
+): Promise<{ costUsd: number | null; inputTokens: number; outputTokens: number }> {
+  const fallback = { costUsd: null as number | null, inputTokens: 0, outputTokens: 0 };
   try {
-    await new Promise((r) => setTimeout(r, 2000));
-    const res = await fetch(`${OPENROUTER_GENERATION_ENDPOINT}?id=${generationId}`, {
+    // OpenRouter's /generation endpoint takes a moment to populate.
+    await new Promise((r) => setTimeout(r, 1500));
+    const res = await fetch(`${OPENROUTER_GENERATION_ENDPOINT}?id=${encodeURIComponent(generationId)}`, {
       headers: { Authorization: `Bearer ${apiKey}` },
     });
-    if (!res.ok) return null;
-    const data = await res.json() as Record<string, any>;
-    return data.data?.total_cost ?? data.data?.usage ?? null;
-  } catch { return null; }
+    if (!res.ok) return fallback;
+    const data = (await res.json()) as { data?: Record<string, unknown> };
+    const d = data.data ?? {};
+    return {
+      costUsd: typeof d.total_cost === "number" ? d.total_cost : null,
+      inputTokens: typeof d.tokens_prompt === "number" ? d.tokens_prompt : 0,
+      outputTokens: typeof d.tokens_completion === "number" ? d.tokens_completion : 0,
+    };
+  } catch {
+    return fallback;
+  }
 }
 
+// ----- main -----
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
-  const config = (ctx.agent.adapterConfig ?? ctx.config) as unknown as OpenRouterConfig;
-  const { context } = ctx;
+  const config = (ctx.agent.adapterConfig ?? ctx.config) as unknown as OpenRouterConfig & {
+    maxTurns?: number;
+    autoApprove?: boolean;
+  };
+  const { context, onLog, agent, authToken } = ctx;
 
-  // Build the prompt the same way other adapters do
-  const resumedSession = !!ctx.runtime.sessionId;
-  const wakePrompt = renderPaperclipWakePrompt(context, { resumedSession });
+  const model = config.model || "openrouter/auto";
+  const maxTurns = typeof config.maxTurns === "number" && config.maxTurns > 0 ? config.maxTurns : DEFAULT_MAX_TURNS;
+  const autoApprove = config.autoApprove === true;
 
-  const messages: Array<{ role: string; content: string }> = [];
-  const defaultSystem = "You are an AI agent working inside Paperclip, an autonomous company orchestration system. When you receive a wake payload, extract the task/issue details and EXECUTE the task. Do not describe or analyze the payload. Focus on the issue title and description and produce useful work output.";
-  messages.push({ role: "system", content: config.systemPrompt || defaultSystem });
+  // Tool handlers need a Paperclip API client. If we have no authToken,
+  // tools are disabled (model can still respond, just can't act).
+  let api: PaperclipApi | null = null;
+  let tools: Tool[] = [];
+  const currentIssueId = extractCurrentIssueId(context);
+  const companyId = agent.companyId;
 
-  if (wakePrompt) {
-    messages.push({ role: "user", content: wakePrompt });
+  if (authToken) {
+    api = new PaperclipApi({ authToken });
+    tools = buildTools({
+      api,
+      agentId: agent.id,
+      companyId,
+      currentIssueId,
+      autoApprove,
+    });
   } else {
-    messages.push({ role: "user", content: JSON.stringify(context) });
+    await writeRawStderr(
+      onLog,
+      "[openrouter] No authToken on context — tool calls disabled. Agent can only generate text.",
+    );
   }
 
+  // Emit init early so the run viewer renders the header.
+  await emitInit(onLog, { model, sessionId: ctx.runId });
+
+  // ----- build messages -----
+
+  const messages: ChatMessage[] = [];
+
+  // System prompt = base + skills
+  let systemContent = config.systemPrompt || DEFAULT_SYSTEM_PROMPT;
   try {
-    const apiKey = resolveApiKey(config);
-    const useStreaming = config.stream ?? true;
-
-    let output: string;
-    let generationId: string | undefined;
-    let usage: UsageSummary | undefined;
-
-    if (useStreaming) {
-      const result = await executeStreaming(apiKey, config, messages, ctx.onLog);
-      output = result.output;
-      generationId = result.generationId;
-      usage = result.usage;
-    } else {
-      const result = await executeNonStreaming(apiKey, config, messages, ctx.onLog);
-      output = result.output;
-      generationId = result.generationId;
-      usage = result.usage;
+    const skills = await loadSkills({ agentConfig: config as unknown as Record<string, unknown>, onLog });
+    if (skills.length > 0) {
+      systemContent = `${systemContent}\n\n${renderSkillsForPrompt(skills)}`;
+      await emitSystem(onLog, `Loaded ${skills.length} skill(s): ${skills.map((s) => s.name).join(", ")}`);
     }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await writeRawStderr(onLog, `[openrouter] skill loading error (continuing): ${reason}`);
+  }
+  messages.push({ role: "system", content: systemContent });
 
-    let costUsd: number | null = null;
-    if (generationId) {
-      costUsd = await fetchGenerationCost(generationId, apiKey);
+  // User prompt = Paperclip wake payload rendered as text
+  const resumedSession = !!ctx.runtime.sessionId;
+  let wakePrompt = "";
+  try {
+    wakePrompt = renderPaperclipWakePrompt(context, { resumedSession }) || "";
+  } catch {
+    wakePrompt = "";
+  }
+  messages.push({
+    role: "user",
+    content: wakePrompt || JSON.stringify(context),
+  });
+
+  // ----- mark issue in_progress -----
+
+  if (api && currentIssueId) {
+    try {
+      await api.updateIssue(currentIssueId, { status: "in_progress" });
+    } catch (err) {
+      // Don't fail the run for status updates.
+      const reason = err instanceof Error ? err.message : String(err);
+      await writeRawStderr(onLog, `[openrouter] could not set issue in_progress: ${reason}`);
     }
+  }
 
-    return {
-      exitCode: 0,
-      signal: null,
-      timedOut: false,
-      usage: usage ?? { inputTokens: 0, outputTokens: 0 },
-      model: config.model || "openrouter/auto",
-      provider: "openrouter",
-      biller: "openrouter",
-      billingType: "api",
-      costUsd,
-      sessionParams: generationId ? { lastGenerationId: generationId } : null,
-      sessionDisplayId: generationId ?? null,
-      sessionId: generationId ?? null,
-    };
-  } catch (err: any) {
-    const errorMessage = err?.message || String(err);
-    await ctx.onLog("stderr", `[openrouter] Error: ${errorMessage}\n`);
+  // ----- tool loop -----
 
+  let apiKey: string;
+  try {
+    apiKey = resolveApiKey(config);
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    await writeRawStderr(onLog, `[openrouter] ${reason}\n`);
+    if (api && currentIssueId) {
+      await api
+        .updateIssue(currentIssueId, { status: "blocked", statusReason: reason })
+        .catch(() => undefined);
+    }
     return {
       exitCode: 1,
       signal: null,
       timedOut: false,
-      errorMessage,
-      errorCode: "OPENROUTER_ERROR",
+      errorMessage: reason,
+      errorCode: "missing_api_key",
       usage: { inputTokens: 0, outputTokens: 0 },
+      model,
+      provider: "openrouter",
+      biller: "openrouter",
+      billingType: resolveBillingType(config),
     };
   }
+
+  let lastGenerationId: string | undefined;
+  let totalUsage: UsageSummary = { inputTokens: 0, outputTokens: 0 };
+  let finalAssistantText = "";
+  let turn = 0;
+  let stoppedReason: "completed" | "max_turns" | "error" = "completed";
+  let runError: { message: string; code: string } | null = null;
+
+  try {
+    while (turn < maxTurns) {
+      turn += 1;
+
+      let response: ChatCompletionResponse;
+      try {
+        response = await callOpenRouter(apiKey, config, messages, tools);
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        runError = { message: reason, code: "openrouter_request_failed" };
+        stoppedReason = "error";
+        break;
+      }
+
+      lastGenerationId = response.id || lastGenerationId;
+      if (response.usage) {
+        totalUsage = {
+          inputTokens: totalUsage.inputTokens + (response.usage.prompt_tokens ?? 0),
+          outputTokens: totalUsage.outputTokens + (response.usage.completion_tokens ?? 0),
+        };
+      }
+
+      const choice = response.choices?.[0];
+      if (!choice) {
+        runError = { message: "OpenRouter returned no choices", code: "openrouter_empty_response" };
+        stoppedReason = "error";
+        break;
+      }
+
+      const msg = choice.message;
+      const reasoning = typeof msg.reasoning === "string" ? msg.reasoning : "";
+      const text = typeof msg.content === "string" ? msg.content : "";
+      const toolCalls = msg.tool_calls ?? [];
+
+      if (reasoning) {
+        await emitThinking(onLog, reasoning);
+      }
+      if (text) {
+        await emitAssistant(onLog, text);
+        finalAssistantText = text;
+      }
+
+      // No tool calls => model is done.
+      if (toolCalls.length === 0) {
+        stoppedReason = "completed";
+        break;
+      }
+
+      // Add the assistant message (with tool_calls) so the model sees its own request.
+      messages.push({
+        role: "assistant",
+        content: text,
+        tool_calls: toolCalls.map((tc) => ({
+          id: tc.id,
+          type: "function",
+          function: { name: tc.function.name, arguments: tc.function.arguments },
+        })),
+      });
+
+      // Execute each tool call and append the results.
+      for (const tc of toolCalls) {
+        const toolName = tc.function.name;
+        const args = safeParseToolArgs(tc.function.arguments);
+        await emitToolCall(onLog, { name: toolName, input: args, toolUseId: tc.id });
+
+        const tool = findTool(tools, toolName);
+        let resultContent: string;
+        let isError: boolean;
+        if (!tool) {
+          resultContent = JSON.stringify({ error: `Unknown tool: ${toolName}` });
+          isError = true;
+        } else {
+          try {
+            const out = await tool.execute(args);
+            resultContent = out.content;
+            isError = out.isError;
+          } catch (err) {
+            resultContent = JSON.stringify({
+              error: err instanceof Error ? err.message : String(err),
+            });
+            isError = true;
+          }
+        }
+
+        await emitToolResult(onLog, {
+          toolUseId: tc.id,
+          toolName,
+          content: resultContent,
+          isError,
+        });
+
+        messages.push({
+          role: "tool",
+          tool_call_id: tc.id,
+          content: resultContent,
+        });
+      }
+    }
+
+    if (turn >= maxTurns && stoppedReason !== "error") {
+      stoppedReason = "max_turns";
+      await writeRawStderr(onLog, `[openrouter] hit max_turns (${maxTurns}), stopping`);
+    }
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    runError = { message: reason, code: "openrouter_loop_failed" };
+    stoppedReason = "error";
+  }
+
+  // ----- post-loop: cost, comment, status -----
+
+  let costUsd: number | null = null;
+  if (lastGenerationId) {
+    const cost = await fetchGenerationCost(lastGenerationId, apiKey);
+    costUsd = cost.costUsd;
+    // Prefer the generation endpoint's token counts when present (more accurate).
+    if (cost.inputTokens > 0 || cost.outputTokens > 0) {
+      totalUsage = { inputTokens: cost.inputTokens, outputTokens: cost.outputTokens };
+    }
+  }
+
+  // Post the final assistant text as a comment so other agents can see it.
+  if (api && currentIssueId && finalAssistantText.trim().length > 0) {
+    try {
+      await api.addIssueComment(currentIssueId, { body: finalAssistantText });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      await writeRawStderr(onLog, `[openrouter] could not post final comment: ${reason}`);
+    }
+  }
+
+  // Update issue status based on outcome.
+  if (api && currentIssueId) {
+    let nextStatus: string | null = null;
+    let statusReason: string | null = null;
+    if (stoppedReason === "completed") {
+      nextStatus = "done";
+    } else if (stoppedReason === "max_turns") {
+      nextStatus = "blocked";
+      statusReason = `Hit max_turns (${maxTurns}) without completing`;
+    } else if (stoppedReason === "error" && runError) {
+      nextStatus = "blocked";
+      statusReason = runError.message;
+    }
+    if (nextStatus) {
+      try {
+        await api.updateIssue(currentIssueId, { status: nextStatus, statusReason });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        await writeRawStderr(onLog, `[openrouter] could not update final status: ${reason}`);
+      }
+    }
+  }
+
+  // Emit the final result transcript entry.
+  await emitResult(onLog, {
+    text: finalAssistantText,
+    inputTokens: totalUsage.inputTokens,
+    outputTokens: totalUsage.outputTokens,
+    costUsd: costUsd ?? 0,
+    subtype: stoppedReason,
+    isError: stoppedReason === "error",
+    errors: runError ? [runError.message] : [],
+  });
+
+  if (stoppedReason === "error" && runError) {
+    return {
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: runError.message,
+      errorCode: runError.code,
+      usage: totalUsage,
+      model,
+      provider: "openrouter",
+      biller: "openrouter",
+      billingType: resolveBillingType(config),
+      costUsd,
+      sessionId: lastGenerationId ?? null,
+      sessionDisplayId: lastGenerationId ?? null,
+      sessionParams: lastGenerationId ? { lastGenerationId } : null,
+    };
+  }
+
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    usage: totalUsage,
+    model,
+    provider: "openrouter",
+    biller: "openrouter",
+    billingType: resolveBillingType(config),
+    costUsd,
+    sessionId: lastGenerationId ?? null,
+    sessionDisplayId: lastGenerationId ?? null,
+    sessionParams: lastGenerationId ? { lastGenerationId } : null,
+    summary: finalAssistantText.slice(0, 500),
+  };
 }
