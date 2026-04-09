@@ -1,5 +1,5 @@
 {
-  "name": "@paperclipai/adapter-openrouter",
+  "name": "paperclip-adapter-openrouter-talha",
   "version": "1.0.0",
   "description": "OpenRouter adapter for Paperclip — access 300+ AI models (free & paid) via a single API key",
   "license": "MIT",
